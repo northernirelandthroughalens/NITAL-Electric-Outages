@@ -5,8 +5,7 @@ import pydeck as pdk
 from datetime import datetime, timedelta
 import random
 import requests
-from bs4 import BeautifulSoup
-import re
+import json
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -16,126 +15,122 @@ st.set_page_config(
 )
 
 # --- LIVE DATA SCRAPER ---
-@st.cache_data(ttl=300)  # Cache data for 5 minutes to prevent spamming the NIE server
+@st.cache_data(ttl=300)  # Cache data for 5 minutes
 def fetch_nienetworks_data():
     """
-    Fetches live fault data from the NIE Powercheck 'TabularFaults' page 
-    and geocodes the postcodes using postcodes.io.
+    Fetches live fault data directly from the NIE Powercheck JSON endpoint.
+    This provides precise lat/long coordinates, avoiding the need for geocoding.
     """
-    url = "https://powercheck.nienetworks.co.uk/TabularFaults.html"
+    # The JSON endpoint used by the live map
+    url = "https://powercheck.nienetworks.co.uk/data/incidents.json"
+    
+    # Headers to mimic a browser request
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Referer': 'https://powercheck.nienetworks.co.uk/',
+        'Accept': 'application/json, text/javascript, */*; q=0.01'
     }
 
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         
-        # Parse HTML with BeautifulSoup to avoid dependency issues with pd.read_html
-        soup = BeautifulSoup(response.text, 'html.parser')
-        table = soup.find('table')
-        
-        if not table:
+        # Parse JSON
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            # Fallback for some servers serving JSON with BOM or weird encoding
+            data = json.loads(response.content.decode('utf-8-sig'))
+            
+        if not data:
             return pd.DataFrame()
-            
-        # Extract headers
-        headers = []
-        header_row = table.find('tr')
-        if header_row:
-            headers = [th.get_text(strip=True) for th in header_row.find_all(['th', 'td'])]
-            
-        # Extract rows
-        rows = []
-        for tr in table.find_all('tr')[1:]: # Skip the first header row
-            cells = tr.find_all('td')
-            if not cells:
-                continue
-            rows.append([cell.get_text(strip=True) for cell in cells])
-            
-        if not rows:
+        
+        # The JSON usually comes as a list of objects or a dictionary with a key like 'incidents'
+        # We handle both cases
+        items = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            # Look for common keys if it's wrapped
+            for key in ['incidents', 'faults', 'outages', 'markers']:
+                if key in data:
+                    items = data[key]
+                    break
+            # If still empty, maybe the dict values are the items
+            if not items:
+                items = list(data.values())
+
+        if not items:
             return pd.DataFrame()
-            
-        # Create DataFrame
-        df = pd.DataFrame(rows, columns=headers if headers else None)
+
+        df = pd.DataFrame(items)
         
-        # Clean up column names (Standardise)
-        # Expected columns usually: Reference, Type, Postcodes, Off Date, Est Restoration, etc.
-        # We rename them to match our dashboard schema
-        df.columns = [c.strip() for c in df.columns]
+        # --- NORMALISE COLUMNS ---
+        # Map JSON keys to our Dashboard schema
+        # Common keys in these datasets: 'id', 'lat', 'lng', 'type', 'cluster', 'message'
         
-        # Map NIE columns to our dashboard columns
-        # Note: Actual column names from NIE might vary slightly, so we map loosely
+        # Create standard columns if they don't exist
         column_mapping = {
-            'Event / Plan Number': 'Incident ID',
-            'Outage Type': 'Type', 
-            'Postcodes Affected': 'Postcode Raw',
-            'Start Time': 'Reported',
-            'Estimated Restoration Time': 'Est. Restoration',
-            'Cluster': 'Location', # Sometimes Cluster is the best proxy for "Location"
-            'Town': 'Town' # Sometimes they have a Town column
+            'id': 'Incident ID',
+            'eventId': 'Incident ID',
+            'lat': 'lat',
+            'latitude': 'lat',
+            'lng': 'lng',
+            'long': 'lng',
+            'longitude': 'lng',
+            'type': 'Type',
+            'faultType': 'Type',
+            'desc': 'Message',
+            'description': 'Message',
+            'cluster': 'Postcode', # Sometimes just an area name
+            'title': 'Location',
+            'restoreTime': 'Est. Restoration',
+            'startDate': 'Reported'
         }
         
+        # Rename columns that match
         df = df.rename(columns=column_mapping)
         
-        # Basic cleaning
-        if 'Location' not in df.columns:
-            df['Location'] = "Unknown Location"
-        
-        # Geocoding Logic
-        # We need to extract a valid Outcode (e.g., BT12) from "BT12 3; BT12 4"
-        def get_coordinates(postcode_raw):
-            if pd.isna(postcode_raw):
-                return None, None
-            
-            # Extract the first valid looking postcode part (e.g., BT1, BT23)
-            # Regex to find the first 'BT' followed by numbers
-            match = re.search(r'(BT\d+)', str(postcode_raw).upper())
-            if not match:
-                return None, None
-                
-            outcode = match.group(1)
-            
-            # Fetch lat/long from postcodes.io (Free UK API)
-            try:
-                # Use a specific user agent for the API
-                api_url = f"https://api.postcodes.io/outcodes/{outcode}"
-                geo_resp = requests.get(api_url, timeout=2)
-                if geo_resp.status_code == 200:
-                    data = geo_resp.json()
-                    if 'result' in data and data['result']:
-                        return data['result']['latitude'], data['result']['longitude']
-            except Exception:
-                pass
-            
-            return None, None
+        # Ensure we have essential columns
+        if 'lat' not in df.columns or 'lng' not in df.columns:
+            # If coordinates are missing, we can't map it. 
+            # (Note: Some APIs put lat/lng in a 'geometry' object, simplistic flat check here)
+            return pd.DataFrame()
 
-        # Apply geocoding (Note: In a high volume app, we would use bulk endpoints)
-        coords = df['Postcode Raw'].apply(lambda x: get_coordinates(x))
-        df['lat'] = [c[0] for c in coords]
-        df['lng'] = [c[1] for c in coords]
-        
-        # Filter out rows where we couldn't find coordinates
+        # Clean Data
+        df['lat'] = pd.to_numeric(df['lat'], errors='coerce')
+        df['lng'] = pd.to_numeric(df['lng'], errors='coerce')
         df = df.dropna(subset=['lat', 'lng'])
 
-        # Add Status (Derived) and Formatting
-        df['Status'] = 'Active' # Default status
-        df['Customers Affected'] = 'N/A' # Tabular view doesn't always show customer counts
+        # Fill missing text fields
+        if 'Type' not in df.columns:
+            df['Type'] = 'Unplanned Outage' # Default
+        if 'Postcode' not in df.columns:
+            df['Postcode'] = 'NI Area'
+        if 'Location' not in df.columns:
+            df['Location'] = 'Unknown Location'
+        if 'Reported' not in df.columns:
+            df['Reported'] = 'Unknown'
+        if 'Est. Restoration' not in df.columns:
+            df['Est. Restoration'] = 'Pending Update'
+
+        # Add Status
+        df['Status'] = 'Active' 
         
-        # Assign Colours based on Type
+        # --- COLOUR CODING ---
         def get_color(type_str):
             t = str(type_str).lower()
-            if 'unplanned' in t or 'fault' in t:
+            if 'unplanned' in t or 'fault' in t or 'hv' in t: # High Voltage / Unplanned
                 return [239, 68, 68, 200]  # Red
-            return [245, 158, 11, 200]     # Amber
+            return [245, 158, 11, 200]     # Amber (Planned/Low Voltage)
             
         df['color'] = df['Type'].apply(get_color)
-        df['Postcode'] = df['Postcode Raw'] # Display version
 
         return df
 
     except Exception as e:
-        st.error(f"Could not fetch live data from NIE: {e}")
-        # Return empty DF on failure so app doesn't crash
+        # If live JSON fails, we return empty so the UI shows the warning rather than crashing
+        # st.error(f"Debug: {e}") # Uncomment for debugging
         return pd.DataFrame()
 
 # --- APP LAYOUT ---
@@ -146,17 +141,17 @@ with col_logo:
     st.markdown("## ⚡")
 with col_title:
     st.title("NIE Powercheck Dashboard")
-    st.caption("Live Data from powercheck.nienetworks.co.uk")
+    st.caption("Live Data from powercheck.nienetworks.co.uk (JSON Feed)")
 
 # Initialize Session State
 if 'data' not in st.session_state:
-    with st.spinner('Connecting to NIE Networks...'):
+    with st.spinner('Connecting to NIE Networks Live Feed...'):
         st.session_state.data = fetch_nienetworks_data()
     st.session_state.last_updated = datetime.now()
 
 # Refresh Button
 if st.button("Refresh Live Data 🔄"):
-    st.cache_data.clear() # Clear cache to force new fetch
+    st.cache_data.clear()
     with st.spinner('Fetching latest updates...'):
         st.session_state.data = fetch_nienetworks_data()
     st.session_state.last_updated = datetime.now()
@@ -165,14 +160,20 @@ if st.button("Refresh Live Data 🔄"):
 df = st.session_state.data
 
 if df.empty:
-    st.warning("No active power cuts found on the NIE network at this moment, or the service is temporarily unavailable.")
+    st.warning("⚠️ Unable to load live data. The NIE Powercheck service may be restricting access or there are zero active faults.")
+    st.info("Tip: This dashboard relies on the public `incidents.json` feed. If NIE changes their API security, this may require a proxy server.")
 else:
     # Top Stats
     st.markdown("---")
     m1, m2, m3 = st.columns(3)
     m1.metric("Active Incidents", len(df))
-    # Count unplanned vs planned
-    unplanned_count = df[df['Type'].str.contains('Unplanned', case=False, na=False)].shape[0]
+    
+    # Safely count unplanned faults
+    if 'Type' in df.columns:
+        unplanned_count = df[df['Type'].str.contains('Unplanned|Fault', case=False, na=False)].shape[0]
+    else:
+        unplanned_count = 0
+        
     m2.metric("Unplanned Faults", unplanned_count)
     m3.metric("Last Check", st.session_state.last_updated.strftime("%H:%M"))
     st.markdown("---")
@@ -189,7 +190,7 @@ else:
             data=df,
             get_position='[lng, lat]',
             get_color='color',
-            get_radius=4000,  # Radius in meters
+            get_radius=2000,
             pickable=True,
             opacity=0.8,
             stroked=True,
@@ -198,19 +199,22 @@ else:
             line_color=[255, 255, 255]
         )
 
-        # Set view to Northern Ireland
+        # Auto-center map based on data
+        mid_lat = df['lat'].mean() if not df.empty else 54.65
+        mid_lng = df['lng'].mean() if not df.empty else -6.5
+
         view_state = pdk.ViewState(
-            latitude=54.65,
-            longitude=-6.5,
+            latitude=mid_lat,
+            longitude=mid_lng,
             zoom=8,
             pitch=0,
         )
 
         tooltip = {
-            "html": "<b>Location:</b> {Postcode Raw}<br/>"
+            "html": "<b>Location:</b> {Location}<br/>"
                     "<b>Type:</b> {Type}<br/>"
-                    "<b>Start:</b> {Reported}<br/>"
-                    "<b>Est. Restoration:</b> {Est. Restoration}",
+                    "<b>Status:</b> {Status}<br/>"
+                    "<b>Restoration:</b> {Est. Restoration}",
             "style": {
                 "backgroundColor": "white",
                 "color": "black",
@@ -234,13 +238,20 @@ else:
     with row1_col2:
         st.subheader("Live Incident List")
         
-        # Display list of incidents
-        for index, row in df.iterrows():
-            with st.expander(f"{row['Postcode']} ({row['Type']})"):
-                st.markdown(f"**Incident ID:** {row['Incident ID']}")
-                st.markdown(f"**Reported:** {row['Reported']}")
-                st.markdown(f"**Restoration:** {row['Est. Restoration']}")
-                # If 'Message' or other columns exist, we could add them here
+        # Display list
+        # Sort by Unplanned first
+        df_sorted = df.sort_values(by='Type', ascending=False)
+        
+        for index, row in df_sorted.iterrows():
+            loc_label = row.get('Location', 'Unknown')
+            # If location is empty or generic, try using Postcode
+            if not loc_label or loc_label == 'Unknown Location':
+                loc_label = row.get('Postcode', 'Fault')
+                
+            with st.expander(f"{loc_label} ({row.get('Type', 'N/A')})"):
+                st.markdown(f"**ID:** {row.get('Incident ID', 'N/A')}")
+                st.markdown(f"**Restoration:** {row.get('Est. Restoration', 'Pending')}")
+                st.markdown(f"**Info:** {row.get('Message', 'No details available.')}")
 
 # Footer
 st.markdown("---")
