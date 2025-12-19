@@ -31,13 +31,32 @@ def fetch_nienetworks_data():
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         
-        # Use pandas to parse the HTML table easily
-        dfs = pd.read_html(response.text)
+        # Parse HTML with BeautifulSoup to avoid dependency issues with pd.read_html
+        soup = BeautifulSoup(response.text, 'html.parser')
+        table = soup.find('table')
         
-        if not dfs:
+        if not table:
             return pd.DataFrame()
-        
-        df = dfs[0]
+            
+        # Extract headers
+        headers = []
+        header_row = table.find('tr')
+        if header_row:
+            headers = [th.get_text(strip=True) for th in header_row.find_all(['th', 'td'])]
+            
+        # Extract rows
+        rows = []
+        for tr in table.find_all('tr')[1:]: # Skip the first header row
+            cells = tr.find_all('td')
+            if not cells:
+                continue
+            rows.append([cell.get_text(strip=True) for cell in cells])
+            
+        if not rows:
+            return pd.DataFrame()
+            
+        # Create DataFrame
+        df = pd.DataFrame(rows, columns=headers if headers else None)
         
         # Clean up column names (Standardise)
         # Expected columns usually: Reference, Type, Postcodes, Off Date, Est Restoration, etc.
